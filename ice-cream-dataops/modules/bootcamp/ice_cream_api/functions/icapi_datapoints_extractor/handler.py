@@ -6,7 +6,7 @@ from cognite.client import CogniteClient
 from cognite.client.data_classes import ExtractionPipelineRun
 from cognite.client.data_classes.data_modeling import NodeId, ViewId
 from cognite.client.data_classes.data_modeling.cdm.v1 import CogniteAsset, CogniteTimeSeries
-from cognite.client.data_classes.filters import Prefix, ContainsAny
+from cognite.client.data_classes.filters import ContainsAny, Equals
 
 from ice_cream_factory_api import IceCreamFactoryAPI
 
@@ -23,57 +23,143 @@ def batcher(iterable, batch_size):
 
 
 def get_time_series_for_site(client: CogniteClient, site):
-    this_site = site.lower()
+    this_site = site.strip().lower()
+
     sub_tree_root = client.data_modeling.instances.retrieve_nodes(
         NodeId("icapi_dm_space", this_site),
-        node_cls=CogniteAsset
+        node_cls=CogniteAsset,
     )
 
     if not sub_tree_root:
         print(
             f"----No CogniteAssets in CDF for {site}!----\n"
-            f"    Run the 'Create Cognite Asset Hierarchy' transformation!"
+            f"    Run the 'Create Cognite Asset Hierarchy' "
+            f"transformation!"
         )
         return []
 
-    sub_tree_nodes = client.data_modeling.instances.list(
-        instance_type=CogniteAsset,
-        filter=Prefix(property=["cdf_cdm", "CogniteAsset/v1", "path"], value=sub_tree_root.path),
-        limit=None
+    sub_tree_nodes = get_asset_subtree(
+        client,
+        sub_tree_root,
     )
 
-    if not sub_tree_nodes:
-        print(
-            f"----No CogniteTimeSeries in CDF for {site}!----\n"
-            f"    Run the 'Contextualize Timeseries and Assets' transformation!"
-        )
-        return []
+    print(
+        f"ASSETS USED FOR TS SEARCH: "
+        f"{len(sub_tree_nodes)} assets for {site}"
+    )
 
-    value_list = [{"space": node.space, "externalId": node.external_id} for node in sub_tree_nodes]
+    value_list = [
+        {
+            "space": node.space,
+            "externalId": node.external_id,
+        }
+        for node in sub_tree_nodes
+    ]
 
-    time_series = [
+    time_series_batches = [
         client.data_modeling.instances.search(
-            view=ViewId("cdf_cdm", "CogniteTimeSeries", "v1"),
+            view=ViewId(
+                "cdf_cdm",
+                "CogniteTimeSeries",
+                "v1",
+            ),
             instance_type=CogniteTimeSeries,
-            filter=ContainsAny(property=["cdf_cdm", "CogniteTimeSeries/v1", "assets"], values=batch),
-            limit=None
+            filter=ContainsAny(
+                property=[
+                    "cdf_cdm",
+                    "CogniteTimeSeries/v1",
+                    "assets",
+                ],
+                values=batch,
+            ),
+            limit=None,
         )
         for batch in batcher(value_list, 20)
     ]
 
-    # Combine list of batch results into a single NodeList
-    time_series = [node for nodelist in time_series for node in nodelist]
+    time_series = [
+        node
+        for batch_result in time_series_batches
+        for node in batch_result
+    ]
 
-    if not time_series:
-        print("No CogniteTimeSeries in the CogniteCore Data Model (cdf_cdm Space)")
+    print(
+        f"FOUND {len(time_series)} TIME SERIES "
+        f"BEFORE NAME FILTER FOR {site}"
+    )
 
     time_series = [
-        item for item in time_series
-        if any(substring in item.external_id for substring in ["planned_status", "good"])
+        item
+        for item in time_series
+        if any(
+            substring in item.external_id
+            for substring in ["planned_status", "good"]
+        )
     ]
+
+    print(
+        f"FOUND {len(time_series)} TARGET TIME SERIES FOR {site}"
+    )
+
+    print(
+        "TARGET TIME SERIES:",
+        [ts.external_id for ts in time_series],
+    )
 
     return time_series
 
+def get_asset_subtree(client: CogniteClient, root: CogniteAsset):
+    all_nodes = [root]
+    current_level = [root]
+
+    while current_level:
+        parent_ids = [
+            {
+                "space": node.space,
+                "externalId": node.external_id,
+            }
+            for node in current_level
+        ]
+
+        next_level = []
+
+        for parent_id in parent_ids:
+            children = client.data_modeling.instances.list(
+                instance_type=CogniteAsset,
+                filter=Equals(
+                    property=[
+                        "cdf_cdm",
+                        "CogniteAsset/v1",
+                        "parent",
+                    ],
+                    value=parent_id,
+                ),
+                limit=None,
+            )
+
+            next_level.extend(children)
+
+        if not next_level:
+            break
+
+        existing_ids = {
+            (node.space, node.external_id)
+            for node in all_nodes
+        }
+
+        next_level = [
+            node
+            for node in next_level
+            if (node.space, node.external_id) not in existing_ids
+        ]
+
+        if not next_level:
+            break
+
+        all_nodes.extend(next_level)
+        current_level = next_level
+
+    return all_nodes
 
 def report_ext_pipe(client: CogniteClient, status, message=None):
     ext_pipe_run = ExtractionPipelineRun(
@@ -165,4 +251,5 @@ def handle(client: CogniteClient = None, data=None):
 
         report_ext_pipe(client, "success")
     except Exception as e:
-        report_ext_pipe(client, "fail", e)
+        report_ext_pipe(client, "failure", str(e))
+        raise

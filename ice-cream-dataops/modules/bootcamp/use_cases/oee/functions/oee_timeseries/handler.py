@@ -6,7 +6,7 @@ from typing import Any, Dict
 from cognite.client import CogniteClient
 from cognite.client.data_classes.data_modeling import NodeId, ViewId
 from cognite.client.data_classes.data_modeling.cdm.v1 import CogniteAsset, CogniteTimeSeries, CogniteTimeSeriesApply
-from cognite.client.data_classes.filters import Prefix, ContainsAny
+from cognite.client.data_classes.filters import  ContainsAny, Equals
 from cognite.client.exceptions import CogniteNotFoundError
 
 import numpy as np
@@ -14,6 +14,53 @@ import numpy as np
 from cognite.client.config import global_config
 global_config.disable_pypi_version_check = True
 
+def get_asset_subtree(
+    client: CogniteClient,
+    root: CogniteAsset,
+):
+    all_nodes = [root]
+    current_level = [root]
+    seen = {(root.space, root.external_id)}
+
+    while current_level:
+        next_level = []
+
+        for node in current_level:
+            parent_id = {
+                "space": node.space,
+                "externalId": node.external_id,
+            }
+
+            children = client.data_modeling.instances.list(
+                instance_type=CogniteAsset,
+                filter=Equals(
+                    property=[
+                        "cdf_cdm",
+                        "CogniteAsset/v1",
+                        "parent",
+                    ],
+                    value=parent_id,
+                ),
+                limit=None,
+            )
+
+            for child in children:
+                child_id = (
+                    child.space,
+                    child.external_id,
+                )
+
+                if child_id not in seen:
+                    seen.add(child_id)
+                    next_level.append(child)
+
+        if not next_level:
+            break
+
+        all_nodes.extend(next_level)
+        current_level = next_level
+
+    return all_nodes
 
 def batcher(iterable, batch_size):
     iterator = iter(iterable)
@@ -21,51 +68,79 @@ def batcher(iterable, batch_size):
         yield batch
 
 
-def get_time_series_for_site(client: CogniteClient, site, space):
-    this_site = site.lower()
-    sub_tree_root = client.data_modeling.instances.retrieve_nodes(
-        NodeId(space, this_site),
-        node_cls=CogniteAsset
+def get_time_series_for_site(
+    client: CogniteClient,
+    site,
+    space,
+):
+    this_site = site.strip().lower()
+
+    sub_tree_root = (
+        client.data_modeling.instances.retrieve_nodes(
+            NodeId(space, this_site),
+            node_cls=CogniteAsset,
+        )
     )
 
     if not sub_tree_root:
         print(
             f"----No CogniteAssets in CDF for {site}!----\n"
-            f"    Run the 'Create Cognite Asset Hierarchy' transformation!"
+            f"    Run the 'Create Cognite Asset Hierarchy' "
+            f"transformation!"
         )
-        return
+        return []
 
-    sub_tree_nodes = client.data_modeling.instances.list(
-        instance_type=CogniteAsset,
-        filter=Prefix(property=["cdf_cdm", "CogniteAsset/v1", "path"], value=sub_tree_root.path),
-        limit=None
+    sub_tree_nodes = get_asset_subtree(
+        client,
+        sub_tree_root,
     )
 
-    if not sub_tree_nodes:
-        print(
-            f"----No CogniteTimeSeries in CDF for {site}!----\n"
-            f"    Run the 'Contextualize Timeseries and Assets' transformation!"
-        )
-        return
+    print(
+        f"ASSETS USED FOR TS SEARCH: "
+        f"{len(sub_tree_nodes)} assets for {site}"
+    )
 
-    value_list = [{"space": node.space, "externalId": node.external_id} for node in sub_tree_nodes]
+    value_list = [
+        {
+            "space": node.space,
+            "externalId": node.external_id,
+        }
+        for node in sub_tree_nodes
+    ]
 
-    time_series = [
+    time_series_batches = [
         client.data_modeling.instances.search(
-            view=ViewId("cdf_cdm", "CogniteTimeSeries", "v1"),
+            view=ViewId(
+                "cdf_cdm",
+                "CogniteTimeSeries",
+                "v1",
+            ),
             instance_type=CogniteTimeSeries,
             space=space,
-            filter=ContainsAny(property=["cdf_cdm", "CogniteTimeSeries/v1", "assets"], values=batch),
-            limit=None
+            filter=ContainsAny(
+                property=[
+                    "cdf_cdm",
+                    "CogniteTimeSeries/v1",
+                    "assets",
+                ],
+                values=batch,
+            ),
+            limit=None,
         )
         for batch in batcher(value_list, 20)
     ]
 
-    # Combine list of batch results into a single NodeList
-    time_series = [node for nodelist in time_series for node in nodelist]
+    time_series = [node for batch_result in time_series_batches for node in batch_result]
+    print(
+        f"FOUND {len(time_series)} INPUT TIME SERIES "
+        f"FOR OEE IN {site}"
+    )
 
     if not time_series:
-        print("No CogniteTimeSeries in the CogniteCore Data Model (cdf_cdm Space)")
+        print(
+            f"No contextualized CogniteTimeSeries "
+            f"found for {site}"
+        )
 
     return time_series
 
