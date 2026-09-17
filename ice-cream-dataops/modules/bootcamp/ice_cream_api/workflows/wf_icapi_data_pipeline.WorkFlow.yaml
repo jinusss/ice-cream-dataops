@@ -1,0 +1,2 @@
+externalId: wf_icapi_data_pipeline
+description: Extract data from Ice Cream API and process it through the data pipeline.
